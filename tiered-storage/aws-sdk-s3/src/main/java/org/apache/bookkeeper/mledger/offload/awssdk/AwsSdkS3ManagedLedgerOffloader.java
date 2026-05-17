@@ -217,11 +217,6 @@ public class AwsSdkS3ManagedLedgerOffloader implements LedgerOffloader {
     }
 
     @Override
-    public boolean isAppendable() {
-        return false;
-    }
-
-    @Override
     public void scanLedgers(OffloadedLedgerMetadataConsumer consumer, Map<String, String> offloadDriverMetadata) {
         throw new UnsupportedOperationException("scanLedgers is not implemented for aws-sdk-s3 offloader yet");
     }
@@ -292,8 +287,14 @@ public class AwsSdkS3ManagedLedgerOffloader implements LedgerOffloader {
                 .region(Region.of(config.region()))
                 .credentialsProvider(credentialsProvider(config));
         if (config.endpoint() != null) {
+            S3Configuration.Builder serviceConfiguration = S3Configuration.builder().pathStyleAccessEnabled(true);
+
+            if (config.endpoint().contains("r2.cloudflarestorage.com")) {
+                serviceConfiguration.chunkedEncodingEnabled(false);
+            }
+
             builder.endpointOverride(URI.create(config.endpoint()))
-                    .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build());
+                    .serviceConfiguration(serviceConfiguration.build());
         }
         return builder.build();
     }

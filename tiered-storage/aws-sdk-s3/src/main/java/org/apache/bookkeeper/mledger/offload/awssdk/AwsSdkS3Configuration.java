@@ -22,7 +22,6 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.stream.Collectors;
 import lombok.Getter;
-import org.apache.commons.lang3.StringUtils;
 
 class AwsSdkS3Configuration {
     static final String DRIVER = "aws-sdk-s3";
@@ -49,8 +48,8 @@ class AwsSdkS3Configuration {
     }
 
     String region() {
-        return StringUtils.defaultIfBlank(first("managedLedgerOffloadRegion", "s3ManagedLedgerOffloadRegion"),
-                "us-east-1");
+        String region = first("managedLedgerOffloadRegion", "s3ManagedLedgerOffloadRegion");
+        return isBlank(region) ? "us-east-1" : region;
     }
 
     String endpoint() {
@@ -76,13 +75,13 @@ class AwsSdkS3Configuration {
     Map<String, String> driverMetadata() {
         return Map.of(
                 "managedLedgerOffloadDriver", DRIVER,
-                "bucket", StringUtils.defaultString(bucket()),
-                "region", StringUtils.defaultString(region()),
-                "serviceEndpoint", StringUtils.defaultString(endpoint()));
+                "bucket", defaultString(bucket()),
+                "region", defaultString(region()),
+                "serviceEndpoint", defaultString(endpoint()));
     }
 
     void validate() {
-        if (StringUtils.isBlank(bucket())) {
+        if (isBlank(bucket())) {
             throw new IllegalArgumentException("S3 bucket is required");
         }
         if (maxBlockSizeInBytes() < 5 * MB) {
@@ -92,16 +91,24 @@ class AwsSdkS3Configuration {
 
     private int intValue(int defaultValue, String... keys) {
         String value = first(keys);
-        return StringUtils.isBlank(value) ? defaultValue : Integer.parseInt(value);
+        return isBlank(value) ? defaultValue : Integer.parseInt(value);
     }
 
     private String first(String... keys) {
         for (String key : keys) {
             String value = properties.get(key);
-            if (StringUtils.isNotBlank(value)) {
+            if (!isBlank(value)) {
                 return value;
             }
         }
         return null;
+    }
+
+    private static String defaultString(String value) {
+        return value == null ? "" : value;
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
     }
 }
