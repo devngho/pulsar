@@ -165,6 +165,7 @@ lz4java = "1.10.3"
 spring = "6.2.12"
 kubernetesclient = "23.0.0"
 aws-sdk = "1.12.788"
+aws-sdk-v2 = "2.29.52"
 hadoop3 = "3.5.0"
 jclouds = "2.6.0"
 # Shading
@@ -421,6 +422,8 @@ json = { module = "org.json:json", version.ref = "json" }
 aws-java-sdk-bom = { module = "com.amazonaws:aws-java-sdk-bom", version.ref = "aws-sdk" }
 aws-java-sdk-core = { module = "com.amazonaws:aws-java-sdk-core", version.ref = "aws-sdk" }
 aws-java-sdk-sts = { module = "com.amazonaws:aws-java-sdk-sts", version.ref = "aws-sdk" }
+aws-sdk-v2-s3 = { module = "software.amazon.awssdk:s3", version.ref = "aws-sdk-v2" }
+aws-sdk-v2-url-connection-client = { module = "software.amazon.awssdk:url-connection-client", version.ref = "aws-sdk-v2" }
 # JClouds
 jclouds-allblobstore = { module = "org.apache.jclouds:jclouds-allblobstore", version.ref = "jclouds" }
 jclouds-blobstore = { module = "org.apache.jclouds:jclouds-blobstore", version.ref = "jclouds" }

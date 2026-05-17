@@ -19,6 +19,16 @@
 
 -->
 
+## About this fork
+
+Experimental fork of Apache Pulsar
+
+### Changes
+
+- A new tiered-storage offloader that uses AWS SDK v2 directly
+
+---
+
 ![logo](https://pulsar.apache.org/img/pulsar.svg)
 
 [![docker pull](https://img.shields.io/docker/pulls/apachepulsar/pulsar-all.svg)](https://hub.docker.com/r/apachepulsar/pulsar)

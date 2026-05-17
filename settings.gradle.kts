@@ -217,6 +217,8 @@ project(":pulsar-functions:pulsar-functions-local-runner-shaded").projectDir = f
 include("jclouds-shaded")
 include("tiered-storage:tiered-storage-jcloud")
 project(":tiered-storage:tiered-storage-jcloud").projectDir = file("tiered-storage/jcloud")
+include("tiered-storage:tiered-storage-aws-sdk-s3")
+project(":tiered-storage:tiered-storage-aws-sdk-s3").projectDir = file("tiered-storage/aws-sdk-s3")
 include("tiered-storage:tiered-storage-file-system")
 project(":tiered-storage:tiered-storage-file-system").projectDir = file("tiered-storage/file-system")
 
