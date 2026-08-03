@@ -235,14 +235,14 @@ public abstract class AbstractMetadataStore implements MetadataStoreExtended, Co
     @Override
     public CompletableFuture<Void> handleMetadataEvent(MetadataEvent event) {
         CompletableFuture<Void> result = new CompletableFuture<>();
-        get(event.getPath()).thenApply(res -> {
+        get(event.getPath()).thenAccept(res -> {
             Set<CreateOption> options = event.getOptions() != null ? event.getOptions()
                     : Collections.emptySet();
             if (res.isPresent()) {
                 GetResult existingValue = res.get();
                 if (shouldIgnoreEvent(event, existingValue)) {
                     result.complete(null);
-                    return result;
+                    return;
                 }
             }
             // else update the event
@@ -262,7 +262,11 @@ public abstract class AbstractMetadataStore implements MetadataStoreExtended, Co
                 }
                 return false;
             });
-            return result;
+        }).exceptionally(ex -> {
+            Throwable cause = FutureUtil.unwrapCompletionException(ex);
+            log.warn().attr("path", event.getPath()).exception(cause).log("Failed to handle metadata event");
+            result.completeExceptionally(cause);
+            return null;
         });
         return result;
     }
@@ -294,7 +298,7 @@ public abstract class AbstractMetadataStore implements MetadataStoreExtended, Co
         }
         // ignore event if metadata is ephemeral or
         // sequential
-        if (options.contains(CreateOption.Ephemeral) || event.getOptions().contains(CreateOption.Sequential)) {
+        if (options.contains(CreateOption.Ephemeral) || options.contains(CreateOption.Sequential)) {
             return true;
         }
         // ignore the event if event occurred before the
@@ -370,9 +374,9 @@ public abstract class AbstractMetadataStore implements MetadataStoreExtended, Co
         return storeGet(path, opts)
                 .whenComplete((v, t) -> {
                     if (t != null) {
-                        v.ifPresent(getResult -> nodeSizeStats.recordGetRes(path, getResult));
                         metadataStoreStats.recordGetOpsFailed(System.currentTimeMillis() - start);
                     } else {
+                        v.ifPresent(getResult -> nodeSizeStats.recordGetRes(path, getResult));
                         metadataStoreStats.recordGetOpsSucceeded(System.currentTimeMillis() - start);
                     }
                 });
@@ -597,6 +601,10 @@ public abstract class AbstractMetadataStore implements MetadataStoreExtended, Co
         getChildrenFromStore(parentPath, opts).thenCompose(children -> {
             CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
             for (String child : children) {
+                if (isSequenceCounterChild(child)) {
+                    // Sidecar bookkeeping for SequenceKeysDeltas — not a user record.
+                    continue;
+                }
                 String childPath = parentPath.equals("/") ? "/" + child : parentPath + "/" + child;
                 chain = chain.thenCompose(__ -> storeGet(childPath, opts))
                         .thenAccept(opt -> opt.ifPresent(consumer::onNext));
@@ -636,6 +644,10 @@ public abstract class AbstractMetadataStore implements MetadataStoreExtended, Co
         getChildrenFromStore(scanPathPrefix, opts).thenCompose(children -> {
             CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
             for (String child : children) {
+                if (isSequenceCounterChild(child)) {
+                    // Sidecar bookkeeping for SequenceKeysDeltas — not a user record.
+                    continue;
+                }
                 String childPath = scanPathPrefix.equals("/") ? "/" + child : scanPathPrefix + "/" + child;
                 chain = chain.thenCompose(__ -> storeGet(childPath, opts))
                         .thenAccept(opt -> opt.filter(fallbackFilter).ifPresent(consumer::onNext));
@@ -759,8 +771,27 @@ public abstract class AbstractMetadataStore implements MetadataStoreExtended, Co
 
     /** Counter-document path for a sequence prefix. Sibling of the prefix at the parent level. */
     static String sequenceCounterPath(String prefix) {
-        return prefix + "__seq_counter__";
+        return prefix + SEQUENCE_COUNTER_SUFFIX;
     }
+
+    /**
+     * @return {@code true} when {@code childName} is a synthesized sequence-counter sidecar — i.e.
+     *     bookkeeping written by {@link #atomicIncrementSequenceCounter}, not a user record. Scan
+     *     primitives use this to filter counters out of their output on non-native backends.
+     *
+     * <p>The match is a literal-suffix check. A user record whose final path segment happens to
+     *     end with {@value #SEQUENCE_COUNTER_SUFFIX} would also be filtered. We accept that as
+     *     acceptable: callers don't get to pick paths ending in the {@code __seq_counter__} marker
+     *     accidentally (the suffix is 16 characters of internal-only marker), and a strict check
+     *     would require either tracking active prefixes or reserving a delimiter that the path
+     *     backends forbid. The cost of a false positive is silently dropping that record from
+     *     {@code scanChildren}/{@code scanByIndex}; no data loss.
+     */
+    static boolean isSequenceCounterChild(String childName) {
+        return childName != null && childName.endsWith(SEQUENCE_COUNTER_SUFFIX);
+    }
+
+    private static final String SEQUENCE_COUNTER_SUFFIX = "__seq_counter__";
 
     /** Format a synthesized sequence key matching Oxia's native format: {@code prefix-{seq:%020d}-...}. */
     static String formatSequenceKey(String prefix, long[] seqs) {
