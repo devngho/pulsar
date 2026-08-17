@@ -115,6 +115,32 @@ public class BufferedOffloadStreamTest {
         testWithPadding(0);
     }
 
+    @Test
+    public void testCloseReleasesCurrentAndQueuedEntries() throws Exception {
+        ByteBuf firstData = Unpooled.buffer(16, 16).writeZero(16);
+        ByteBuf secondData = Unpooled.buffer(16, 16).writeZero(16);
+        Entry firstEntry = EntryImpl.create(0, 0, firstData);
+        Entry secondEntry = EntryImpl.create(0, 1, secondData);
+        firstData.release();
+        secondData.release();
+
+        List<Entry> entries = new LinkedList<>();
+        entries.add(firstEntry);
+        entries.add(secondEntry);
+        int blockSize = StreamingDataBlockHeaderImpl.getDataStartOffset()
+                + 2 * (BufferedOffloadStream.ENTRY_HEADER_SIZE + 16);
+
+        try (BufferedOffloadStream inputStream = new BufferedOffloadStream(blockSize, entries, 0, 0)) {
+            byte[] partialBlock = new byte[StreamingDataBlockHeaderImpl.getDataStartOffset()
+                    + BufferedOffloadStream.ENTRY_HEADER_SIZE + 1];
+            assertEquals(inputStream.read(partialBlock), partialBlock.length);
+        }
+
+        assertEquals(firstData.refCnt(), 0);
+        assertEquals(secondData.refCnt(), 0);
+        assertEquals(entries.size(), 0);
+    }
+
     @Test(enabled = false, description = "Disable because let offloader to ensure there is no another ledger id")
     public void shouldEndWhenSegmentChanged() throws IOException {
         int blockSize = StreamingDataBlockHeaderImpl.getDataStartOffset();

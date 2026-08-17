@@ -38,7 +38,7 @@ import org.testng.annotations.AfterMethod;
 
 public abstract class BlobStoreManagedLedgerOffloaderBase {
 
-    public static final String BUCKET = "pulsar-unittest";
+    public static final String BUCKET = System.getProperty("S3Bucket", "pulsar-unittest");
     protected static final int DEFAULT_BLOCK_SIZE = 5 * 1024 * 1024;
     protected static final int DEFAULT_READ_BUFFER_SIZE = 1 * 1024 * 1024;
 
@@ -120,9 +120,11 @@ public abstract class BlobStoreManagedLedgerOffloaderBase {
             metaData.putAll(additionalConfig);
         }
         metaData.put(TieredStorageConfiguration.BLOB_STORE_PROVIDER_KEY, provider.getDriver());
-        metaData.put(getConfigKey(TieredStorageConfiguration.METADATA_FIELD_REGION), "");
+        metaData.put(getConfigKey(TieredStorageConfiguration.METADATA_FIELD_REGION),
+                System.getProperty("S3Region", ""));
         metaData.put(getConfigKey(TieredStorageConfiguration.METADATA_FIELD_BUCKET), bucket);
-        metaData.put(getConfigKey(TieredStorageConfiguration.METADATA_FIELD_ENDPOINT), "");
+        metaData.put(getConfigKey(TieredStorageConfiguration.METADATA_FIELD_ENDPOINT),
+                System.getProperty("S3Endpoint", ""));
 
         TieredStorageConfiguration config = TieredStorageConfiguration.create(metaData);
         config.setProviderCredentials(getBlobStoreCredentials());

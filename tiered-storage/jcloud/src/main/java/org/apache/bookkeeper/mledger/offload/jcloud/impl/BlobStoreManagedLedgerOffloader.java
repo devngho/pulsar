@@ -22,6 +22,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.time.Duration;
 import java.util.Collections;
@@ -83,7 +84,6 @@ import org.jclouds.domain.LocationBuilder;
 import org.jclouds.domain.LocationScope;
 import org.jclouds.io.Payload;
 import org.jclouds.io.Payloads;
-import org.jclouds.io.payloads.InputStreamPayload;
 
 /**
  * Tiered Storage Offloader that is backed by a JCloud Blob Store.
@@ -110,6 +110,7 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
     private final ConcurrentMap<BlobStoreLocation, BlobStore> blobStores = new ConcurrentHashMap<>();
     private OffloadSegmentInfoImpl segmentInfo;
     private final AtomicLong bufferLength = new AtomicLong(0);
+    private final AtomicLong bufferedSerializedLength = new AtomicLong(0);
     private final AtomicLong segmentLength = new AtomicLong(0);
     private final long maxBufferLength;
     private final OffsetsCache entryOffsetsCache;
@@ -264,7 +265,7 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
                     try (BlockAwareSegmentInputStream blockStream = new BlockAwareSegmentInputStreamImpl(
                             readHandle, startEntry, blockSize, this.offloaderStats, managedLedgerName)) {
 
-                        Payload partPayload = Payloads.newInputStreamPayload(blockStream);
+                        Payload partPayload = createRepeatableBlockPayload(blockStream, blockSize);
                         partPayload.getContentMetadata().setContentLength((long) blockSize);
                         partPayload.getContentMetadata().setContentType("application/octet-stream");
                         parts.add(writeBlobStore.uploadMultipartPart(mpu, partId, partPayload));
@@ -311,7 +312,8 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
 
             // upload index block
             try (OffloadIndexBlock index = indexBuilder.withDataObjectLength(dataObjectLength).build();
-                 IndexInputStream indexStream = index.toStream()) {
+                 IndexInputStream indexStream = index.toStream();
+                 Payload indexPayload = Payloads.newByteArrayPayload(indexStream.readAllBytes())) {
                 // write the index block
                 BlobBuilder blobBuilder = writeBlobStore.blobBuilder(indexBlockKey);
                 Map<String, String> objectMetadata = new HashMap<>(userMetadata);
@@ -320,14 +322,14 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
                     objectMetadata.putAll(extraMetadata);
                 }
                 DataBlockUtils.addVersionInfo(blobBuilder, objectMetadata);
-                Payload indexPayload = Payloads.newInputStreamPayload(indexStream);
-                indexPayload.getContentMetadata().setContentLength(indexStream.getStreamSize());
+                long indexSize = indexStream.getStreamSize();
+                indexPayload.getContentMetadata().setContentLength(indexSize);
                 indexPayload.getContentMetadata().setContentType("application/octet-stream");
 
                 Blob blob = blobBuilder
                         .payload(indexPayload)
-                        .contentLength(indexStream.getStreamSize())
-                    .build();
+                        .contentLength(indexSize)
+                        .build();
                 writeBlobStore.putBlob(config.getBucket(), blob);
                 promise.complete(null);
             } catch (Throwable t) {
@@ -422,33 +424,42 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
     private void streamingOffloadLoop(int partId, int dataObjectLength) {
         log.debug().attr("partId", partId).attr("dataObjectLength", dataObjectLength)
                 .log("Streaming offload loop");
-        if (segmentInfo.isClosed() && offloadBuffer.isEmpty()) {
+        if (offloadResult.isDone()) {
+            return;
+        } else if (segmentInfo.isClosed() && offloadBuffer.isEmpty()) {
             buildIndexAndCompleteResult(dataObjectLength);
-            offloadResult.complete(segmentInfo.result());
         } else if ((segmentInfo.isClosed() && !offloadBuffer.isEmpty())
                 // last time to build and upload block
-                || bufferLength.get() >= streamingBlockSize
+                || bufferedSerializedLength.get() + StreamingDataBlockHeaderImpl.getDataStartOffset()
+                >= streamingBlockSize
             // buffer size full, build and upload block
         ) {
             List<Entry> entries = new LinkedList<>();
-            int blockEntrySize = 0;
-            final Entry firstEntry = offloadBuffer.poll();
-            entries.add(firstEntry);
+            final Entry firstEntry = offloadBuffer.peek();
             long blockLedgerId = firstEntry.getLedgerId();
             long blockEntryId = firstEntry.getEntryId();
+            long blockSerializedSize = StreamingDataBlockHeaderImpl.getDataStartOffset();
 
-            while (!offloadBuffer.isEmpty() && offloadBuffer.peek().getLedgerId() == blockLedgerId
-                    && blockEntrySize <= streamingBlockSize) {
-                final Entry entryInBlock = offloadBuffer.poll();
+            Entry entryInBlock;
+            while ((entryInBlock = offloadBuffer.peek()) != null
+                    && entryInBlock.getLedgerId() == blockLedgerId
+                    && blockSerializedSize + BufferedOffloadStream.ENTRY_HEADER_SIZE
+                    + entryInBlock.getLength() <= streamingBlockSize) {
+                entryInBlock = offloadBuffer.poll();
                 final int entrySize = entryInBlock.getLength();
                 bufferLength.addAndGet(-entrySize);
-                blockEntrySize += entrySize;
+                bufferedSerializedLength.addAndGet(-((long) BufferedOffloadStream.ENTRY_HEADER_SIZE + entrySize));
+                blockSerializedSize += BufferedOffloadStream.ENTRY_HEADER_SIZE + entrySize;
                 entries.add(entryInBlock);
             }
-            final int blockSize = BufferedOffloadStream
-                    .calculateBlockSize(streamingBlockSize, entries.size(), blockEntrySize);
-            buildBlockAndUpload(blockSize, entries, blockLedgerId, blockEntryId, partId);
-            streamingOffloadLoop(partId + 1, dataObjectLength + blockSize);
+            if (entries.isEmpty()) {
+                failStreamingOffload(new IOException("Entry " + blockLedgerId + ":" + blockEntryId
+                        + " cannot fit in streaming block of size " + streamingBlockSize));
+                return;
+            }
+            if (buildBlockAndUpload(streamingBlockSize, entries, blockLedgerId, blockEntryId, partId)) {
+                streamingOffloadLoop(partId + 1, dataObjectLength + streamingBlockSize);
+            }
         } else {
             log.debug().attr("partId", partId).attr("dataObjectLength", dataObjectLength)
                     .log("Not enough data, delaying schedule");
@@ -459,13 +470,14 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
         }
     }
 
-    private void buildBlockAndUpload(int blockSize, List<Entry> entries, long blockLedgerId, long beginEntryId,
-                                     int partId) {
+    private boolean buildBlockAndUpload(int blockSize, List<Entry> entries, long blockLedgerId, long beginEntryId,
+                                        int partId) {
         try (final BufferedOffloadStream payloadStream = new BufferedOffloadStream(blockSize, entries,
                 blockLedgerId, beginEntryId)) {
             log.debug().attr("ledgerId", blockLedgerId).attr("beginEntryId", beginEntryId)
                     .log("Begin upload payload");
-            Payload partPayload = Payloads.newInputStreamPayload(payloadStream);
+            Payload partPayload = createRepeatableBlockPayload(payloadStream, blockSize);
+            partPayload.getContentMetadata().setContentLength((long) blockSize);
             partPayload.getContentMetadata().setContentType("application/octet-stream");
             streamingParts.add(blobStore.uploadMultipartPart(streamingMpu, partId, partPayload));
             streamingIndexBuilder.withDataBlockHeaderLength(StreamingDataBlockHeaderImpl.getDataStartOffset());
@@ -483,42 +495,81 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
             log.debug().attr("container", config.getBucket())
                     .attr("blobName", streamingDataBlockKey).attr("partId", partId)
                     .attr("mpuId", streamingMpu.id()).log("Uploaded multipart part");
+            return true;
         } catch (Throwable e) {
-            blobStore.abortMultipartUpload(streamingMpu);
-            offloadResult.completeExceptionally(e);
-            return;
+            failStreamingOffload(e);
+            return false;
         }
     }
 
     private void buildIndexAndCompleteResult(long dataObjectLength) {
         try {
             blobStore.completeMultipartUpload(streamingMpu, streamingParts);
+            streamingMpu = null;
+        } catch (Throwable e) {
+            failStreamingOffload(e);
+            return;
+        }
+
+        try {
             streamingIndexBuilder.withDataObjectLength(dataObjectLength);
-            final OffloadIndexBlockV2 index = streamingIndexBuilder.buildV2();
-            final IndexInputStream indexStream = index.toStream();
             final BlobBuilder indexBlobBuilder = blobStore.blobBuilder(streamingDataIndexKey);
             streamingIndexBuilder.withDataBlockHeaderLength(StreamingDataBlockHeaderImpl.getDataStartOffset());
 
             DataBlockUtils.addVersionInfo(indexBlobBuilder, userMetadata);
-            try (final InputStreamPayload indexPayLoad = Payloads.newInputStreamPayload(indexStream)) {
-                indexPayLoad.getContentMetadata().setContentLength(indexStream.getStreamSize());
-                indexPayLoad.getContentMetadata().setContentType("application/octet-stream");
-                final Blob indexBlob = indexBlobBuilder.payload(indexPayLoad)
-                        .contentLength(indexStream.getStreamSize())
+            try (OffloadIndexBlockV2 index = streamingIndexBuilder.buildV2();
+                 IndexInputStream indexStream = index.toStream();
+                 Payload indexPayload = Payloads.newByteArrayPayload(indexStream.readAllBytes())) {
+                long indexSize = indexStream.getStreamSize();
+                indexPayload.getContentMetadata().setContentLength(indexSize);
+                indexPayload.getContentMetadata().setContentType("application/octet-stream");
+                final Blob indexBlob = indexBlobBuilder.payload(indexPayload)
+                        .contentLength(indexSize)
                         .build();
                 blobStore.putBlob(config.getBucket(), indexBlob);
 
                 final OffloadResult result = segmentInfo.result();
                 offloadResult.complete(result);
                 log.debug().attr("result", result).log("Offload segment completed");
-            } catch (Exception e) {
-                log.error().exception(e).log("Streaming offload failed");
-                offloadResult.completeExceptionally(e);
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log.error().exception(e).log("Streaming offload failed");
             offloadResult.completeExceptionally(e);
         }
+    }
+
+    private void failStreamingOffload(Throwable error) {
+        closeSegment();
+        releaseOffloadBuffer();
+        try {
+            if (streamingMpu != null) {
+                blobStore.abortMultipartUpload(streamingMpu);
+            }
+        } catch (Throwable abortError) {
+            error.addSuppressed(abortError);
+            log.error().attr("bucket", config.getBucket())
+                    .attr("key", streamingDataBlockKey).exception(abortError)
+                    .log("Failed to abort streaming multipart upload");
+        }
+        offloadResult.completeExceptionally(error);
+    }
+
+    private void releaseOffloadBuffer() {
+        Entry entry;
+        while ((entry = offloadBuffer.poll()) != null) {
+            entry.release();
+        }
+        bufferLength.set(0);
+        bufferedSerializedLength.set(0);
+    }
+
+    private static Payload createRepeatableBlockPayload(InputStream inputStream, int expectedLength)
+            throws IOException {
+        byte[] data = inputStream.readNBytes(expectedLength);
+        if (data.length != expectedLength || inputStream.read() != -1) {
+            throw new IOException("Serialized offload block length does not match its declared length");
+        }
+        return Payloads.newByteArrayPayload(data);
     }
 
     private CompletableFuture<OffloadResult> getOffloadResultAsync() {
@@ -539,6 +590,8 @@ public class BlobStoreManagedLedgerOffloader implements LedgerOffloader {
                     .create(entry.getLedgerId(), entry.getEntryId(), entry.getDataBuffer());
             offloadBuffer.add(entryImpl);
             bufferLength.getAndAdd(entryImpl.getLength());
+            bufferedSerializedLength.getAndAdd((long) BufferedOffloadStream.ENTRY_HEADER_SIZE
+                    + entryImpl.getLength());
             segmentLength.getAndAdd(entryImpl.getLength());
             lastOfferedPosition = entryImpl.getPosition();
             if (segmentLength.get() >= maxSegmentLength

@@ -57,6 +57,7 @@ public class BufferedOffloadStream extends InputStream {
     static final int NOT_INITIALIZED = -1;
     int validDataOffset = NOT_INITIALIZED;
     CompositeByteBuf currentEntry;
+    private boolean closed;
 
     public long getLedgerId() {
         return ledgerId;
@@ -102,14 +103,21 @@ public class BufferedOffloadStream extends InputStream {
         Entry headEntry = entryBuffer.remove(0);
 
         //create new block when a ledger end
-        if (headEntry.getLedgerId() != this.ledgerId) {
+        long entryLedgerId = headEntry.getLedgerId();
+        if (entryLedgerId != this.ledgerId) {
+            headEntry.release();
             throw new RuntimeException(
-                    String.format("there should not be multi ledger in a block %s %s", headEntry.getLedgerId(),
+                    String.format("there should not be multi ledger in a block %s %s", entryLedgerId,
                             this.ledgerId));
         }
 
         final int entryLength = headEntry.getLength();
         final long entryId = headEntry.getEntryId();
+        if ((long) offset + ENTRY_HEADER_SIZE + entryLength > blockSize) {
+            headEntry.release();
+            throw new IOException(String.format("entry %s:%s does not fit in block of size %s",
+                    ledgerId, entryId, blockSize));
+        }
         CompositeByteBuf entryBuf = PulsarByteBufAllocator.DEFAULT.compositeBuffer(2);
         ByteBuf entryHeaderBuf = PulsarByteBufAllocator.DEFAULT.buffer(ENTRY_HEADER_SIZE, ENTRY_HEADER_SIZE);
         entryHeaderBuf.writeInt(entryLength).writeLong(entryId);
@@ -123,7 +131,21 @@ public class BufferedOffloadStream extends InputStream {
 
     @Override
     public void close() throws IOException {
-        blockHead.close();
+        if (closed) {
+            return;
+        }
+        closed = true;
+        try {
+            blockHead.close();
+        } finally {
+            if (currentEntry != null) {
+                currentEntry.release();
+                currentEntry = null;
+            }
+            while (!entryBuffer.isEmpty()) {
+                entryBuffer.remove(0).release();
+            }
+        }
     }
 
     public static int calculateBlockSize(int streamingBlockSize, int entryCount, int entrySize) {

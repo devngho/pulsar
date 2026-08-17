@@ -25,8 +25,10 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.fail;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
@@ -46,6 +48,9 @@ import org.apache.bookkeeper.mledger.offload.jcloud.provider.JCloudBlobStoreProv
 import org.apache.bookkeeper.mledger.offload.jcloud.provider.TieredStorageConfiguration;
 import org.apache.bookkeeper.mledger.proto.OffloadContext;
 import org.jclouds.blobstore.BlobStore;
+import org.jclouds.blobstore.domain.Blob;
+import org.jclouds.io.Payload;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.testng.Assert;
 import org.testng.annotations.Test;
@@ -124,10 +129,115 @@ public class BlobStoreManagedLedgerOffloaderStreamingTest extends BlobStoreManag
     }
 
     @Test
+    public void testIndexPayloadIsRepeatable() throws Exception {
+        BlobStore spiedBlobStore = mock(BlobStore.class, delegatesTo(blobStore));
+        Map<String, String> additionalConfig = new HashMap<>();
+        additionalConfig.put(TieredStorageConfiguration.MAX_OFFLOAD_SEGMENT_SIZE_IN_BYTES, "1000");
+        additionalConfig.put(config.getKeys(TieredStorageConfiguration.METADATA_FIELD_MAX_BLOCK_SIZE).get(0),
+                "5242880");
+        additionalConfig.put(TieredStorageConfiguration.MAX_OFFLOAD_SEGMENT_ROLLOVER_TIME_SEC, "600");
+        @Cleanup
+        LedgerOffloader offloader = getOffloader(spiedBlobStore, additionalConfig);
+        ManagedLedger ml = createMockManagedLedger();
+        UUID uuid = UUID.randomUUID();
+        @Cleanup
+        OffloadHandle offloadHandle = offloader.streamingOffload(ml, uuid, 0, 0, new HashMap<>()).get();
+        try {
+            for (int i = 0; i < 10; i++) {
+                byte[] data = new byte[100];
+                random.nextBytes(data);
+                Entry entry = EntryImpl.create(0, i, data);
+                try {
+                    offloadHandle.offerEntry(entry);
+                } finally {
+                    entry.release();
+                }
+            }
+            offloadHandle.getOffloadResultAsync().get();
+
+            ArgumentCaptor<Blob> indexBlob = ArgumentCaptor.forClass(Blob.class);
+            Mockito.verify(spiedBlobStore).putBlob(Mockito.eq(BUCKET), indexBlob.capture());
+            assertRepeatablePayload(indexBlob.getValue());
+        } finally {
+            offloader.deleteOffloaded(uuid, offloader.getOffloadDriverMetadata()).get();
+        }
+        Assert.assertFalse(blobStore.blobExists(BUCKET, uuid.toString()));
+        Assert.assertFalse(blobStore.blobExists(BUCKET, DataBlockUtils.indexBlockOffloadKey(uuid)));
+    }
+
+    @Test
+    public void testStreamingPartsHaveFixedLengthAndRepeatablePayloads() throws Exception {
+        BlobStore spiedBlobStore = mock(BlobStore.class, delegatesTo(blobStore));
+        int entrySize = DEFAULT_BLOCK_SIZE - StreamingDataBlockHeaderImpl.getDataStartOffset()
+                - BufferedOffloadStream.ENTRY_HEADER_SIZE;
+        Map<String, String> additionalConfig = new HashMap<>();
+        additionalConfig.put(TieredStorageConfiguration.MAX_OFFLOAD_SEGMENT_SIZE_IN_BYTES,
+                Integer.toString(3 * entrySize));
+        additionalConfig.put(TieredStorageConfiguration.MAX_OFFLOAD_SEGMENT_ROLLOVER_TIME_SEC, "600");
+        @Cleanup
+        LedgerOffloader offloader = getOffloader(spiedBlobStore, additionalConfig);
+        UUID uuid = UUID.randomUUID();
+        @Cleanup
+        OffloadHandle offloadHandle = offloader.streamingOffload(createMockManagedLedger(), uuid, 0, 0,
+                new HashMap<>()).get();
+
+        for (int i = 0; i < 3; i++) {
+            Entry entry = EntryImpl.create(0, i, new byte[entrySize]);
+            try {
+                assertEquals(offloadHandle.offerEntry(entry), OffloadHandle.OfferEntryResult.SUCCESS);
+            } finally {
+                entry.release();
+            }
+        }
+        offloadHandle.getOffloadResultAsync().get();
+
+        ArgumentCaptor<Payload> partPayloads = ArgumentCaptor.forClass(Payload.class);
+        Mockito.verify(spiedBlobStore, Mockito.times(3))
+                .uploadMultipartPart(Mockito.any(), Mockito.anyInt(), partPayloads.capture());
+        assertFixedLengthRepeatablePayloads(partPayloads.getAllValues(), 3, DEFAULT_BLOCK_SIZE);
+    }
+
+    private static void assertFixedLengthRepeatablePayloads(List<Payload> payloads, int expectedParts,
+                                                             int expectedLength) throws IOException {
+        assertEquals(payloads.size(), expectedParts);
+        for (Payload payload : payloads) {
+            Assert.assertTrue(payload.isRepeatable());
+            assertEquals(payload.getContentMetadata().getContentLength().longValue(), expectedLength);
+            byte[] firstRead;
+            byte[] secondRead;
+            try (InputStream input = payload.openStream()) {
+                firstRead = input.readAllBytes();
+            }
+            try (InputStream input = payload.openStream()) {
+                secondRead = input.readAllBytes();
+            }
+            assertEquals(firstRead.length, expectedLength);
+            assertEquals(secondRead, firstRead);
+        }
+    }
+
+    private static void assertRepeatablePayload(Blob blob) throws IOException {
+        Payload payload = blob.getPayload();
+        Assert.assertTrue(payload.isRepeatable());
+        byte[] firstRead;
+        byte[] secondRead;
+        try (InputStream input = payload.openStream()) {
+            firstRead = input.readAllBytes();
+        }
+        try (InputStream input = payload.openStream()) {
+            secondRead = input.readAllBytes();
+        }
+        assertEquals(secondRead, firstRead);
+        assertEquals(payload.getContentMetadata().getContentLength().longValue(), firstRead.length);
+        assertEquals(blob.getMetadata().getContentMetadata().getContentLength().longValue(), firstRead.length);
+    }
+
+    @Test
     public void testReadAndWrite() throws Exception {
         @Cleanup
         LedgerOffloader offloader = getOffloader(new HashMap<String, String>() {{
-            put(TieredStorageConfiguration.MAX_OFFLOAD_SEGMENT_SIZE_IN_BYTES, "1000");
+            put(TieredStorageConfiguration.MAX_OFFLOAD_SEGMENT_SIZE_IN_BYTES,
+                    Integer.toString(6 * 1024 * 1024));
             put(config.getKeys(TieredStorageConfiguration.METADATA_FIELD_MAX_BLOCK_SIZE).get(0), "5242880");
             put(TieredStorageConfiguration.MAX_OFFLOAD_SEGMENT_ROLLOVER_TIME_SEC, "600");
         }});
@@ -142,37 +252,40 @@ public class BlobStoreManagedLedgerOffloaderStreamingTest extends BlobStoreManag
         @Cleanup
         OffloadHandle offloadHandle = offloader
                 .streamingOffload(ml, uuid, beginLedger, beginEntry, driverMeta).get();
-
-        //Segment should closed because size in bytes full
         final LinkedList<Entry> entries = new LinkedList<>();
-        for (int i = 0; i < 10; i++) {
-            final byte[] data = new byte[100];
-            random.nextBytes(data);
-            final EntryImpl entry = EntryImpl.create(0, i, data);
-            offloadHandle.offerEntry(entry);
-            entries.add(entry);
+        try {
+            //Segment should closed because size in bytes full
+            for (int i = 0; i < 2; i++) {
+                final byte[] data = new byte[3 * 1024 * 1024];
+                random.nextBytes(data);
+                final EntryImpl entry = EntryImpl.create(0, i, data);
+                offloadHandle.offerEntry(entry);
+                entries.add(entry);
+            }
+            final LedgerOffloader.OffloadResult offloadResult = offloadHandle.getOffloadResultAsync().get();
+            assertEquals(offloadResult.endLedger, 0);
+            assertEquals(offloadResult.endEntry, 1);
+            final OffloadContext context = new OffloadContext();
+            context.addOffloadSegment()
+                    .setUidLsb(uuid.getLeastSignificantBits())
+                    .setUidMsb(uuid.getMostSignificantBits())
+                    .setComplete(true).setEndEntryId(1);
+
+            try (ReadHandle readHandle = offloader.readOffloaded(0, context, driverMeta).get();
+                 LedgerEntries ledgerEntries = readHandle.readAsync(0, 1).get()) {
+                for (LedgerEntry ledgerEntry : ledgerEntries) {
+                    final EntryImpl storedEntry = (EntryImpl) entries.get((int) ledgerEntry.getEntryId());
+                    final byte[] storedData = storedEntry.getData();
+                    final byte[] entryBytes = ledgerEntry.getEntryBytes();
+                    assertEquals(storedData, entryBytes);
+                }
+            }
+        } finally {
+            entries.forEach(Entry::release);
+            offloader.deleteOffloaded(uuid, driverMeta).get();
         }
-
-        final LedgerOffloader.OffloadResult offloadResult = offloadHandle.getOffloadResultAsync().get();
-        assertEquals(offloadResult.endLedger, 0);
-        assertEquals(offloadResult.endEntry, 9);
-        final OffloadContext context = new OffloadContext();
-        context.addOffloadSegment()
-                .setUidLsb(uuid.getLeastSignificantBits())
-                .setUidMsb(uuid.getMostSignificantBits())
-                .setComplete(true).setEndEntryId(9);
-
-        @Cleanup
-        final ReadHandle readHandle = offloader.readOffloaded(0, context, driverMeta).get();
-        @Cleanup
-        final LedgerEntries ledgerEntries = readHandle.readAsync(0, 9).get();
-
-        for (LedgerEntry ledgerEntry : ledgerEntries) {
-            final EntryImpl storedEntry = (EntryImpl) entries.get((int) ledgerEntry.getEntryId());
-            final byte[] storedData = storedEntry.getData();
-            final byte[] entryBytes = ledgerEntry.getEntryBytes();
-            assertEquals(storedData, entryBytes);
-        }
+        Assert.assertFalse(blobStore.blobExists(BUCKET, uuid.toString()));
+        Assert.assertFalse(blobStore.blobExists(BUCKET, DataBlockUtils.indexBlockOffloadKey(uuid)));
     }
 
     @Test

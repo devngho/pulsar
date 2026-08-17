@@ -40,7 +40,6 @@ val offloaderNars by configurations.creating {
 
 dependencies {
     offloaderNars(project(":tiered-storage:tiered-storage-jcloud"))
-    offloaderNars(project(":tiered-storage:tiered-storage-aws-sdk-s3"))
     offloaderNars(project(":tiered-storage:tiered-storage-file-system"))
 }
 

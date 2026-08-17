@@ -29,6 +29,7 @@ import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -56,7 +57,10 @@ import org.apache.bookkeeper.mledger.offload.jcloud.provider.JCloudBlobStoreProv
 import org.apache.bookkeeper.mledger.offload.jcloud.provider.TieredStorageConfiguration;
 import org.apache.pulsar.common.naming.TopicName;
 import org.jclouds.blobstore.BlobStore;
+import org.jclouds.blobstore.domain.Blob;
 import org.jclouds.blobstore.options.CopyOptions;
+import org.jclouds.io.Payload;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
@@ -120,6 +124,50 @@ public class BlobStoreManagedLedgerOffloaderTest extends BlobStoreManagedLedgerO
     }
 
     @Test(timeOut = 600000)  // 10 minutes.
+    public void testIndexPayloadIsRepeatable() throws Exception {
+        BlobStore spiedBlobStore = mock(BlobStore.class, delegatesTo(blobStore));
+        @Cleanup
+        LedgerOffloader offloader = getOffloader(spiedBlobStore);
+        @Cleanup
+        ReadHandle readHandle = buildReadHandle();
+        UUID uuid = UUID.randomUUID();
+        try {
+            offloader.offload(readHandle, uuid, new HashMap<>()).get();
+
+            ArgumentCaptor<Payload> partPayload = ArgumentCaptor.forClass(Payload.class);
+            Mockito.verify(spiedBlobStore).uploadMultipartPart(any(), anyInt(), partPayload.capture());
+            assertTrue(partPayload.getValue().isRepeatable());
+            assertNotNull(partPayload.getValue().getContentMetadata().getContentLength());
+
+            ArgumentCaptor<Blob> indexBlob = ArgumentCaptor.forClass(Blob.class);
+            Mockito.verify(spiedBlobStore).putBlob(Mockito.eq(BUCKET), indexBlob.capture());
+            assertRepeatablePayload(indexBlob.getValue());
+        } finally {
+            offloader.deleteOffloaded(readHandle.getId(), uuid, config.getOffloadDriverMetadata()).get();
+        }
+        Assert.assertFalse(blobStore.blobExists(BUCKET,
+                DataBlockUtils.dataBlockOffloadKey(readHandle.getId(), uuid)));
+        Assert.assertFalse(blobStore.blobExists(BUCKET,
+                DataBlockUtils.indexBlockOffloadKey(readHandle.getId(), uuid)));
+    }
+
+    private static void assertRepeatablePayload(Blob blob) throws IOException {
+        Payload payload = blob.getPayload();
+        assertTrue(payload.isRepeatable());
+        byte[] firstRead;
+        byte[] secondRead;
+        try (InputStream input = payload.openStream()) {
+            firstRead = input.readAllBytes();
+        }
+        try (InputStream input = payload.openStream()) {
+            secondRead = input.readAllBytes();
+        }
+        assertEquals(secondRead, firstRead);
+        assertEquals(payload.getContentMetadata().getContentLength().longValue(), firstRead.length);
+        assertEquals(blob.getMetadata().getContentMetadata().getContentLength().longValue(), firstRead.length);
+    }
+
+    @Test(timeOut = 600000)  // 10 minutes.
     public void testBucketDoesNotExist() throws Exception {
 
         if (provider == JCloudBlobStoreProvider.TRANSIENT) {
@@ -146,29 +194,37 @@ public class BlobStoreManagedLedgerOffloaderTest extends BlobStoreManagedLedgerO
         LedgerOffloader offloader = getOffloader();
 
         UUID uuid = UUID.randomUUID();
-        offloader.offload(toWrite, uuid, new HashMap<>()).get();
+        try {
+            offloader.offload(toWrite, uuid, new HashMap<>()).get();
 
-        @Cleanup
-        ReadHandle toTest = offloader.readOffloaded(toWrite.getId(), uuid, Collections.emptyMap()).get();
-        assertEquals(toTest.getLastAddConfirmed(), toWrite.getLastAddConfirmed());
+            try (ReadHandle toTest = offloader.readOffloaded(toWrite.getId(), uuid, Collections.emptyMap()).get()) {
+                assertEquals(toTest.getLastAddConfirmed(), toWrite.getLastAddConfirmed());
 
-        try (LedgerEntries toWriteEntries = toWrite.read(0, toWrite.getLastAddConfirmed());
-             LedgerEntries toTestEntries = toTest.read(0, toTest.getLastAddConfirmed())) {
-            Iterator<LedgerEntry> toWriteIter = toWriteEntries.iterator();
-            Iterator<LedgerEntry> toTestIter = toTestEntries.iterator();
+                try (LedgerEntries toWriteEntries = toWrite.read(0, toWrite.getLastAddConfirmed());
+                     LedgerEntries toTestEntries = toTest.read(0, toTest.getLastAddConfirmed())) {
+                    Iterator<LedgerEntry> toWriteIter = toWriteEntries.iterator();
+                    Iterator<LedgerEntry> toTestIter = toTestEntries.iterator();
 
-            while (toWriteIter.hasNext() && toTestIter.hasNext()) {
-                LedgerEntry toWriteEntry = toWriteIter.next();
-                LedgerEntry toTestEntry = toTestIter.next();
+                    while (toWriteIter.hasNext() && toTestIter.hasNext()) {
+                        LedgerEntry toWriteEntry = toWriteIter.next();
+                        LedgerEntry toTestEntry = toTestIter.next();
 
-                assertEquals(toWriteEntry.getLedgerId(), toTestEntry.getLedgerId());
-                assertEquals(toWriteEntry.getEntryId(), toTestEntry.getEntryId());
-                assertEquals(toWriteEntry.getLength(), toTestEntry.getLength());
-                assertEquals(toWriteEntry.getEntryBuffer(), toTestEntry.getEntryBuffer());
+                        assertEquals(toWriteEntry.getLedgerId(), toTestEntry.getLedgerId());
+                        assertEquals(toWriteEntry.getEntryId(), toTestEntry.getEntryId());
+                        assertEquals(toWriteEntry.getLength(), toTestEntry.getLength());
+                        assertEquals(toWriteEntry.getEntryBuffer(), toTestEntry.getEntryBuffer());
+                    }
+                    Assert.assertFalse(toWriteIter.hasNext());
+                    Assert.assertFalse(toTestIter.hasNext());
+                }
             }
-            Assert.assertFalse(toWriteIter.hasNext());
-            Assert.assertFalse(toTestIter.hasNext());
+        } finally {
+            offloader.deleteOffloaded(toWrite.getId(), uuid, config.getOffloadDriverMetadata()).get();
         }
+        Assert.assertFalse(blobStore.blobExists(BUCKET,
+                DataBlockUtils.dataBlockOffloadKey(toWrite.getId(), uuid)));
+        Assert.assertFalse(blobStore.blobExists(BUCKET,
+                DataBlockUtils.indexBlockOffloadKey(toWrite.getId(), uuid)));
     }
 
     @Test(timeOut = 60000)
@@ -621,26 +677,34 @@ public class BlobStoreManagedLedgerOffloaderTest extends BlobStoreManagedLedgerO
         LedgerOffloader offloader = getOffloader();
 
         UUID uuid = UUID.randomUUID();
-        offloader.offload(toWrite, uuid, new HashMap<>()).get();
+        try {
+            offloader.offload(toWrite, uuid, new HashMap<>()).get();
 
-        List<OffloadedLedgerMetadata> result = new ArrayList<>();
-        offloader.scanLedgers(
-                (m) -> {
-                    log.info().attr("metadata", m).log("Found offloaded ledger");
-                    if (m.getLedgerId() == toWrite.getId()) {
-                        result.add(m);
-                    }
-                    return true;
-                }, offloader.getOffloadDriverMetadata());
-        assertEquals(2, result.size());
+            List<OffloadedLedgerMetadata> result = new ArrayList<>();
+            offloader.scanLedgers(
+                    (m) -> {
+                        log.info().attr("metadata", m).log("Found offloaded ledger");
+                        if (uuid.toString().equals(m.getUuid())) {
+                            result.add(m);
+                        }
+                        return true;
+                    }, offloader.getOffloadDriverMetadata());
+            assertEquals(2, result.size());
 
-        // data and index
+            // data and index
 
-        OffloadedLedgerMetadata offloadedLedgerMetadata = result.get(0);
-        assertEquals(toWrite.getId(), offloadedLedgerMetadata.getLedgerId());
+            OffloadedLedgerMetadata offloadedLedgerMetadata = result.get(0);
+            assertEquals(toWrite.getId(), offloadedLedgerMetadata.getLedgerId());
 
-        OffloadedLedgerMetadata offloadedLedgerMetadata2 = result.get(1);
-        assertEquals(toWrite.getId(), offloadedLedgerMetadata2.getLedgerId());
+            OffloadedLedgerMetadata offloadedLedgerMetadata2 = result.get(1);
+            assertEquals(toWrite.getId(), offloadedLedgerMetadata2.getLedgerId());
+        } finally {
+            offloader.deleteOffloaded(toWrite.getId(), uuid, config.getOffloadDriverMetadata()).get();
+        }
+        Assert.assertFalse(blobStore.blobExists(BUCKET,
+                DataBlockUtils.dataBlockOffloadKey(toWrite.getId(), uuid)));
+        Assert.assertFalse(blobStore.blobExists(BUCKET,
+                DataBlockUtils.indexBlockOffloadKey(toWrite.getId(), uuid)));
     }
 
     @Test

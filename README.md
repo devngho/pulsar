@@ -25,7 +25,7 @@ Experimental fork of Apache Pulsar
 
 ### Changes
 
-- A new tiered-storage offloader that uses AWS SDK v2 directly
+- Cloudflare R2 support in the jclouds tiered-storage offloader
 
 ---
 
